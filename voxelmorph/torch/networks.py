@@ -166,7 +166,7 @@ class VxmDense(LoadableModel):
         self.integrate = layers.VecInt(down_shape, int_steps) if int_steps > 0 else None
 
         # configure transformer
-        self.transformer = layers.SpatialTransformer(inshape)
+        self.transformer = layers.SpatialTransformer(inshape, mode='nearest')
 
     def forward(self, source, target, registration=False):
         '''

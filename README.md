@@ -4,7 +4,7 @@
 
 # Tutorial
 
-Visit the [VoxelMorph tutorial](http://tutorial.voxelmorph.net/) to learn about VoxelMorph and Learning-based Registration
+Visit the [VoxelMorph tutorial](http://tutorial.voxelmorph.net/) to learn about VoxelMorph and Learning-based Registration. Here's an [additional small tutorial](https://colab.research.google.com/drive/1V0CutSIfmtgDJg1XIkEnGteJuw0u7qT-#scrollTo=h1KXYz-Nauwn) on warping annotations together with images, and another on [template (atlas) construction](https://colab.research.google.com/drive/1SkQbrWTQHpQFrG4J2WoBgGZC9yAzUas2?usp=sharing) with VoxelMorph.
 
 
 # Instructions
@@ -14,6 +14,10 @@ To use the VoxelMorph library, either clone this repository and install the requ
 ```
 pip install voxelmorph
 ```
+
+## Pre-trained models
+
+See list of pre-trained models available [here](data/readme.md#models).
 
 ## Training
 
@@ -76,6 +80,20 @@ In the original MICCAI code, the parameters were applied after the scaling of th
 
 If you use voxelmorph or some part of the code, please cite (see [bibtex](citations.bib)):
 
+  * HyperMorph, avoiding the need to tune registration hyperparameters:   
+
+    **HyperMorph: Amortized Hyperparameter Learning for Image Registration.**  
+    A. Hoopes, M. Hoffmann, B. Fischl, J. Guttag, A.V. Dalca   
+    IPMI: Information Processing in Medical Imaging. 2021. [eprint arxiv:2101.01035](https://arxiv.org/abs/2101.01035)
+
+
+  * SynthMorph, avoiding the need to have data at training (!):  
+
+    **Learning image registration without images.**      
+    M. Hoffmann, B. Billot, J.E. Iglesias, B. Fischl, A.V. Dalca  
+    Preprint. [eprint arXiv:2004.10282](https://arxiv.org/abs/2004.10282)
+
+
   * For the atlas formation model:  
   
     **Learning Conditional Deformable Templates with Convolutional Networks**  
@@ -116,12 +134,6 @@ We encourage users to download and process their own data. See [a list of medica
 
 # Creation of Deformable Templates
 
-We present a template consturction method in this [preprint](https://arxiv.org/abs/1908.02738): 
-
-  *  **Learning Conditional Deformable Templates with Convolutional Networks**  
-  [Adrian V. Dalca](http://adalca.mit.edu), [Marianne Rakic](https://mariannerakic.github.io/), [John Guttag](https://people.csail.mit.edu/guttag/), [Mert R. Sabuncu](http://sabuncu.engineering.cornell.edu/)
-  NeurIPS 2019. [eprint arXiv:1908.02738](https://arxiv.org/abs/1908.02738)
-
 To experiment with this method, please use `train_template.py` for unconditional templates and `train_cond_template.py` for conditional templates, which use the same conventions as voxelmorph (please note that these files are less polished than the rest of the voxelmorph library).
 
 We've also provided an unconditional atlas in `data/generated_uncond_atlas.npz.npy`. 
@@ -131,5 +143,21 @@ Models in h5 format weights are provided for [unconditional atlas here](http://p
 **Explore the atlases [interactively here](http://voxelmorph.mit.edu/atlas_creation/)** with tipiX!
 
 
+# SynthMorph
+
+SynthMorph is a strategy for learning registration without acquired imaging data, producing powerful networks agnostic to contrast induced by MRI ([eprint arXiv:2004.10282](https://arxiv.org/abs/2004.10282)).
+
+We provide model files for a ["shapes" variant](https://surfer.nmr.mgh.harvard.edu/ftp/data/voxelmorph/synthmorph/shapes-dice-vel-3-res-8-16-32-256f.h5) of SynthMorph, that we train using images synthesized from random shapes only, and a ["brains" variant](https://surfer.nmr.mgh.harvard.edu/ftp/data/voxelmorph/synthmorph/brains-dice-vel-0.5-res-16-256f.h5), that we train using images synthesized from brain label maps. We train the brains variant by optimizing a loss term that measures volume overlap of a [selection of brain labels](https://surfer.nmr.mgh.harvard.edu/ftp/data/voxelmorph/synthmorph/fs-labels.npy). For registration with either model, please use the `register.py` script with the respective model weights.
+
+Accurate registration requires the input images to be min-max normalized, such that voxel intensities range from 0 to 1, and to be resampled in the affine space of a [reference image](https://surfer.nmr.mgh.harvard.edu/ftp/data/voxelmorph/synthmorph/ref.nii.gz). The affine registration can be performed with a variety of packages, and we choose FreeSurfer. First, we skull-strip the images with [SAMSEG](https://surfer.nmr.mgh.harvard.edu/fswiki/Samseg), keeping brain labels only. Second, we run [mri_robust_register](https://surfer.nmr.mgh.harvard.edu/fswiki/mri_robust_register):
+
+```
+mri_robust_register --mov in.nii.gz --dst out.nii.gz --lta transform.lta --satit --iscale
+mri_robust_register --mov in.nii.gz --dst out.nii.gz --lta transform.lta --satit --iscale --ixform transform.lta --affine
+```
+
+where we replace `--satit --iscale` with `--cost NMI` for registration across MRI contrasts.
+
+
 # Contact:
-For any problems or questions please [open an issue](https://github.com/voxelmorph/voxelmorph/issues/new?labels=voxelmorph) in github.  
+For any problems or questions please [open an issue](https://github.com/voxelmorph/voxelmorph/issues/new?labels=voxelmorph) for code problems/questions or [start a discussion](https://github.com/voxelmorph/voxelmorph/discussions) for general registration/voxelmorph question/discussion.  

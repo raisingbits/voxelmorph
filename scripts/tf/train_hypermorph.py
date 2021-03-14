@@ -1,27 +1,16 @@
 #!/usr/bin/env python
 
 """
-Example script to train a VoxelMorph model.
+Example script for training a HyperMorph model to tune the
+regularization weight hyperparameter.
 
-You will likely have to customize this script slightly to accommodate your own data. All images
-should be appropriately cropped and scaled to values between 0 and 1.
+If you use this code, please cite the following:
 
-If an atlas file is provided with the --atlas flag, then scan-to-atlas training is performed.
-Otherwise, registration will be scan-to-scan.
+    A Hoopes, M Hoffmann, B Fischl, J Guttag, AV Dalca. 
+    HyperMorph: Amortized Hyperparameter Learning for Image Registration
+    arXiv preprint arXiv:2101.01035, 2021. https://arxiv.org/abs/2101.01035
 
-If you use this code, please cite the following, and read function docs for further info/citations.
-
-    VoxelMorph: A Learning Framework for Deformable Medical Image Registration
-    G. Balakrishnan, A. Zhao, M. R. Sabuncu, J. Guttag, A.V. Dalca.
-    IEEE TMI: Transactions on Medical Imaging. 38(8). pp 1788-1800. 2019. 
-
-    or
-
-    Unsupervised Learning for Probabilistic Diffeomorphic Registration for Images and Surfaces
-    A.V. Dalca, G. Balakrishnan, J. Guttag, M.R. Sabuncu. 
-    MedIA: Medical Image Analysis. (57). pp 226-236, 2019 
-
-Copyright 2020 Adrian V. Dalca
+Copyright 2020 Andrew Hoopes
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in
 compliance with the License. You may obtain a copy of the License at
@@ -40,6 +29,9 @@ import argparse
 import numpy as np
 import tensorflow as tf
 import voxelmorph as vxm
+from tensorflow.keras import backend as K
+
+tf.compat.v1.disable_v2_behavior()
 
 
 # parse the commandline
@@ -49,11 +41,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--img-list', required=True, help='line-seperated list of training files')
 parser.add_argument('--img-prefix', help='optional input image file prefix')
 parser.add_argument('--img-suffix', help='optional input image file suffix')
-parser.add_argument('--atlas', help='optional atlas filename')
+parser.add_argument('--atlas', help='atlas filename')
 parser.add_argument('--model-dir', default='models',
                     help='model output directory (default: models)')
 parser.add_argument('--multichannel', action='store_true',
                     help='specify that data has multiple channels')
+parser.add_argument('--test-reg', nargs=3,
+                    help='example registration pair and result (moving fixed moved) to test')
 
 # training parameters
 parser.add_argument('--gpu', default='0', help='GPU ID numbers (default: 0)')
@@ -76,18 +70,14 @@ parser.add_argument('--int-steps', type=int, default=7,
                     help='number of integration steps (default: 7)')
 parser.add_argument('--int-downsize', type=int, default=2,
                     help='flow downsample factor for integration (default: 2)')
-parser.add_argument('--use-probs', action='store_true', help='enable probabilities')
-parser.add_argument('--bidir', action='store_true', help='enable bidirectional cost function')
 
 # loss hyperparameters
 parser.add_argument('--image-loss', default='mse',
                     help='image reconstruction loss - can be mse or ncc (default: mse)')
-parser.add_argument('--lambda', type=float, dest='lambda_weight', default=0.01,
-                    help='weight of gradient or KL loss (default: 0.01)')
-parser.add_argument('--kl-lambda', type=float, default=10,
-                    help='prior lambda regularization for KL loss (default: 10)')
-parser.add_argument('--legacy-image-sigma', dest='image_sigma', type=float, default=1.0,
-                    help='image noise parameter for miccai 2018 network (recommended value is 0.02 when --use-probs is enabled)')  # nopep8
+parser.add_argument('--image-sigma', type=float, default=0.05,
+                    help='estimated image noise for mse image scaling (default: 0.05)')
+parser.add_argument('--oversample-rate', type=float, default=0.4,
+                    help='end-point hyperparameter over-sample rate (default 0.4)')
 args = parser.parse_args()
 
 # load and prepare training data
@@ -102,14 +92,33 @@ if args.atlas:
     # scan-to-atlas generator
     atlas = vxm.py.utils.load_volfile(args.atlas, np_var='vol',
                                       add_batch_axis=True, add_feat_axis=add_feat_axis)
-    generator = vxm.generators.scan_to_atlas(train_files, atlas,
-                                             batch_size=args.batch_size,
-                                             bidir=args.bidir,
-                                             add_feat_axis=add_feat_axis)
+    base_generator = vxm.generators.scan_to_atlas(train_files, atlas,
+                                                  batch_size=args.batch_size,
+                                                  add_feat_axis=add_feat_axis)
 else:
     # scan-to-scan generator
-    generator = vxm.generators.scan_to_scan(
-        train_files, batch_size=args.batch_size, bidir=args.bidir, add_feat_axis=add_feat_axis)
+    base_generator = vxm.generators.scan_to_scan(
+        train_files, batch_size=args.batch_size, add_feat_axis=add_feat_axis)
+
+
+# random hyperparameter generator
+def random_hyperparam():
+    if np.random.rand() < args.oversample_rate:
+        return np.random.choice([0, 1])
+    else:
+        return np.random.rand()
+
+
+# hyperparameter generator extension
+def hyp_generator():
+    while True:
+        hyp = np.expand_dims([random_hyperparam() for _ in range(args.batch_size)], -1)
+        inputs, outputs = next(base_generator)
+        inputs = (*inputs, hyp)
+        yield (inputs, outputs)
+
+
+generator = hyp_generator()
 
 # extract shape and number of features from sampled input
 sample_shape = next(generator)[0][0].shape
@@ -120,11 +129,6 @@ nfeats = sample_shape[-1]
 model_dir = args.model_dir
 os.makedirs(model_dir, exist_ok=True)
 
-# tensorflow device handling
-device, nb_devices = vxm.tf.utils.setup_device(args.gpu)
-assert np.mod(args.batch_size, nb_devices) == 0, \
-    'Batch size (%d) should be a multiple of the nr of gpus (%d)' % (args.batch_size, nb_devices)
-
 # unet architecture
 enc_nf = args.enc if args.enc else [16, 32, 32, 32]
 dec_nf = args.dec if args.dec else [32, 32, 32, 32, 32, 16, 16]
@@ -132,18 +136,20 @@ dec_nf = args.dec if args.dec else [32, 32, 32, 32, 32, 16, 16]
 # prepare model checkpoint save path
 save_filename = os.path.join(model_dir, '{epoch:04d}.h5')
 
+# tensorflow device handling
+device, nb_devices = vxm.tf.utils.setup_device(args.gpu)
+
 with tf.device(device):
 
     # build the model
-    model = vxm.networks.VxmDense(
+    model = vxm.networks.HyperVxmDense(
         inshape=inshape,
         nb_unet_features=[enc_nf, dec_nf],
-        bidir=args.bidir,
-        use_probs=args.use_probs,
         int_steps=args.int_steps,
         int_downsize=args.int_downsize,
         src_feats=nfeats,
-        trg_feats=nfeats
+        trg_feats=nfeats,
+        unet_half_res=True
     )
 
     # load initial weights (if provided)
@@ -154,43 +160,48 @@ with tf.device(device):
     if args.image_loss == 'ncc':
         image_loss_func = vxm.losses.NCC().loss
     elif args.image_loss == 'mse':
-        image_loss_func = vxm.losses.MSE(args.image_sigma).loss
+        scaling = 1.0 / (args.image_sigma ** 2)
+        image_loss_func = lambda x1, x2: scaling * K.mean(K.batch_flatten(K.square(x1 - x2)), -1)
     else:
         raise ValueError('Image loss should be "mse" or "ncc", but found "%s"' % args.image_loss)
 
-    # need two image loss functions if bidirectional
-    if args.bidir:
-        losses = [image_loss_func, image_loss_func]
-        weights = [0.5, 0.5]
-    else:
-        losses = [image_loss_func]
-        weights = [1]
+    # prepare loss functions and compile model
+    def image_loss(y_true, y_pred):
+        hyp = (1 - tf.squeeze(model.references.hyper_val))
+        return hyp * image_loss_func(y_true, y_pred)
 
-    # prepare deformation loss
-    if args.use_probs:
-        flow_shape = model.outputs[-1].shape[1:-1]
-        losses += [vxm.losses.KL(args.kl_lambda, flow_shape).loss]
-    else:
-        losses += [vxm.losses.Grad('l2', loss_mult=args.int_downsize).loss]
+    def grad_loss(y_true, y_pred):
+        hyp = tf.squeeze(model.references.hyper_val)
+        return hyp * vxm.losses.Grad('l2', loss_mult=args.int_downsize).loss(y_true, y_pred)
 
-    weights += [args.lambda_weight]
-
-    # multi-gpu support
-    if nb_devices > 1:
-        save_callback = vxm.networks.ModelCheckpointParallel(save_filename)
-        model = tf.keras.utils.multi_gpu_model(model, gpus=nb_devices)
-    else:
-        save_callback = tf.keras.callbacks.ModelCheckpoint(save_filename, period=20)
-
-    model.compile(optimizer=tf.keras.optimizers.Adam(lr=args.lr), loss=losses, loss_weights=weights)
+    model.compile(optimizer=tf.keras.optimizers.Adam(lr=args.lr), loss=[image_loss, grad_loss])
 
     # save starting weights
     model.save(save_filename.format(epoch=args.initial_epoch))
+    save_callback = tf.keras.callbacks.ModelCheckpoint(save_filename, period=20)
 
     model.fit_generator(generator,
                         initial_epoch=args.initial_epoch,
                         epochs=args.epochs,
                         steps_per_epoch=args.steps_per_epoch,
                         callbacks=[save_callback],
-                        verbose=1
-                        )
+                        verbose=1)
+
+    # save an example registration across lambda values
+    if args.test_reg:
+        moving = vxm.py.utils.load_volfile(args.test_reg[0], add_batch_axis=True,
+                                           add_feat_axis=add_feat_axis)
+        fixed = vxm.py.utils.load_volfile(args.test_reg[1], add_batch_axis=True,
+                                          add_feat_axis=add_feat_axis)
+        moved = []
+
+        # sweep across 20 values of lambda
+        for i, hyp in enumerate(np.linspace(0, 1, 20)):
+            hyp = np.array([[hyp]], dtype='float32')  # reformat hyperparam
+            img = model.predict([moving, fixed, hyp])[0].squeeze()
+            moved.append(img)
+
+        moved = np.stack(moved, axis=-1)
+        if moved.ndim == 3:
+            moved = np.expand_dims(moved, axis=-2)  # if 2D, ensure multi-frame nifti
+        vxm.py.utils.save_volfile(moved, args.test_reg[2])

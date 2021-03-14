@@ -7,25 +7,25 @@ from . import py
 
 
 def volgen(
-        vol_names,
-        batch_size=1, 
-        return_segs=False,
-        np_var='vol',
-        pad_shape=None,
-        resize_factor=1,
-        add_feat_axis=True
-    ):
+    vol_names,
+    batch_size=1,
+    segs=None,
+    np_var='vol',
+    pad_shape=None,
+    resize_factor=1,
+    add_feat_axis=True
+):
     """
     Base generator for random volume loading. Volumes can be passed as a path to
     the parent directory, a glob pattern or a list of file paths. Corresponding
-    segmentations are additionally loaded if return_segs is set to True. If
-    loading segmentations, npz files with variable names 'vol' and 'seg' are
+    segmentations are additionally loaded if `segs` is provided as alist or set to
+    True. If `segs` is True, npz files with variable names 'vol' and 'seg' are
     expected.
 
     Parameters:
         vol_names: Path, glob pattern or list of volume files to load.
         batch_size: Batch size. Default is 1.
-        return_segs: Loads corresponding segmentations. Default is False.
+        segs: Loads corresponding segmentations. Default is None.
         np_var: Name of the volume variable if loading npz files. Default is 'vol'.
         pad_shape: Zero-pads loaded volumes to a given shape. Default is None.
         resize_factor: Volume resize factor. Default is 1.
@@ -38,20 +38,29 @@ def volgen(
             vol_names = os.path.join(vol_names, '*')
         vol_names = glob.glob(vol_names)
 
+    if isinstance(segs, list) and len(segs) != len(vol_names):
+        raise ValueError('Number of image files must match number of seg files.')
+
     while True:
         # generate [batchsize] random image indices
         indices = np.random.randint(len(vol_names), size=batch_size)
 
         # load volumes and concatenate
-        load_params = dict(np_var=np_var, add_batch_axis=True, add_feat_axis=add_feat_axis, pad_shape=pad_shape, resize_factor=resize_factor)
+        load_params = dict(np_var=np_var, add_batch_axis=True, add_feat_axis=add_feat_axis,
+                           pad_shape=pad_shape, resize_factor=resize_factor)
         imgs = [py.utils.load_volfile(vol_names[i], **load_params) for i in indices]
         vols = [np.concatenate(imgs, axis=0)]
 
         # optionally load segmentations and concatenate
-        if return_segs:
+        if segs is True:
+            # assume inputs are npz files with 'seg' key
             load_params['np_var'] = 'seg'  # be sure to load seg
-            segs = [py.utils.load_volfile(vol_names[i], **load_params) for i in indices]
-            vols.append(np.concatenate(segs, axis=0))
+            s = [py.utils.load_volfile(vol_names[i], **load_params) for i in indices]
+            vols.append(np.concatenate(s, axis=0))
+        elif isinstance(segs, list):
+            # assume segs is a corresponding file list
+            s = [py.utils.load_volfile(segs[i], **load_params) for i in indices]
+            vols.append(np.concatenate(s, axis=0))
 
         yield tuple(vols)
 
@@ -65,7 +74,8 @@ def scan_to_scan(vol_names, bidir=False, batch_size=1, prob_same=0, no_warp=Fals
         bidir: Yield input image as output for bidirectional models. Default is False.
         batch_size: Batch size. Default is 1.
         prob_same: Induced probability that source and target inputs are the same. Default is 0.
-        no_warp: Excludes null warp in output list if set to True (for affine training). Default if False.
+        no_warp: Excludes null warp in output list if set to True (for affine training). 
+            Default if False.
         kwargs: Forwarded to the internal volgen generator.
     """
     zeros = None
@@ -86,7 +96,7 @@ def scan_to_scan(vol_names, bidir=False, batch_size=1, prob_same=0, no_warp=Fals
             shape = scan1.shape[1:-1]
             zeros = np.zeros((batch_size, *shape, len(shape)))
 
-        invols  = [scan1, scan2]
+        invols = [scan1, scan2]
         outvols = [scan2, scan1] if bidir else [scan2]
         if not no_warp:
             outvols.append(zeros)
@@ -94,7 +104,7 @@ def scan_to_scan(vol_names, bidir=False, batch_size=1, prob_same=0, no_warp=Fals
         yield (invols, outvols)
 
 
-def scan_to_atlas(vol_names, atlas, bidir=False, batch_size=1, no_warp=False, **kwargs):
+def scan_to_atlas(vol_names, atlas, bidir=False, batch_size=1, no_warp=False, segs=None, **kwargs):
     """
     Generator for scan-to-atlas registration.
 
@@ -106,36 +116,44 @@ def scan_to_atlas(vol_names, atlas, bidir=False, batch_size=1, no_warp=False, **
         atlas: Atlas volume data.
         bidir: Yield input image as output for bidirectional models. Default is False.
         batch_size: Batch size. Default is 1.
-        no_warp: Excludes null warp in output list if set to True (for affine training). Default if False.
+        no_warp: Excludes null warp in output list if set to True (for affine training). 
+            Default is False.
+        segs: Load segmentations as output, for supervised training. Forwarded to the
+            internal volgen generator. Default is None.
         kwargs: Forwarded to the internal volgen generator.
     """
     shape = atlas.shape[1:-1]
     zeros = np.zeros((batch_size, *shape, len(shape)))
     atlas = np.repeat(atlas, batch_size, axis=0)
-    gen = volgen(vol_names, batch_size=batch_size, **kwargs)
+    gen = volgen(vol_names, batch_size=batch_size, segs=segs, **kwargs)
     while True:
-        scan = next(gen)[0]
-        invols  = [scan, atlas]
-        outvols = [atlas, scan] if bidir else [atlas]
+        res = next(gen)
+        scan = res[0]
+        invols = [scan, atlas]
+        if not segs:
+            outvols = [atlas, scan] if bidir else [atlas]
+        else:
+            seg = res[1]
+            outvols = [seg, scan] if bidir else [seg]
         if not no_warp:
             outvols.append(zeros)
         yield (invols, outvols)
 
 
-def semisupervised(vol_names, labels, atlas_file=None, downsize=2):
+def semisupervised(vol_names, seg_names, labels, atlas_file=None, downsize=2):
     """
     Generator for semi-supervised registration training using ground truth segmentations.
-    Scan-to-atlas training can be enabled by providing the atlas_file argument. It's
-    expected that vol_names and atlas_file are npz files with both 'vol' and 'seg' arrays.
+    Scan-to-atlas training can be enabled by providing the atlas_file argument. 
 
     Parameters:
-        vol_names: List of volume npz files to load.
+        vol_names: List of volume files to load.
+        seg_names: List of corresponding seg files to load.
         labels: Array of discrete label values to use in training.
         atlas_file: Atlas npz file for scan-to-atlas training. Default is None.
         downsize: Downsize factor for segmentations. Default is 2.
     """
     # configure base generator
-    gen = volgen(vol_names, return_segs=True, np_var='vol')
+    gen = volgen(vol_names, segs=seg_names, np_var='vol')
     zeros = None
 
     # internal utility to generate downsampled prob seg from discrete seg
@@ -147,8 +165,10 @@ def semisupervised(vol_names, labels, atlas_file=None, downsize=2):
 
     # cache target vols and segs if atlas is supplied
     if atlas_file:
-        trg_vol = py.utils.load_volfile(atlas_file, np_var='vol', add_batch_axis=True, add_feat_axis=True)
-        trg_seg = py.utils.load_volfile(atlas_file, np_var='seg', add_batch_axis=True, add_feat_axis=True)
+        trg_vol = py.utils.load_volfile(atlas_file, np_var='vol',
+                                        add_batch_axis=True, add_feat_axis=True)
+        trg_seg = py.utils.load_volfile(atlas_file, np_var='seg',
+                                        add_batch_axis=True, add_feat_axis=True)
         trg_seg = split_seg(trg_seg)
 
     while True:
@@ -166,34 +186,38 @@ def semisupervised(vol_names, labels, atlas_file=None, downsize=2):
             shape = src_vol.shape[1:-1]
             zeros = np.zeros((1, *shape, len(shape)))
 
-        invols  = [src_vol, trg_vol, src_seg]
-        outvols = [trg_vol, zeros,   trg_seg]
+        invols = [src_vol, trg_vol, src_seg]
+        outvols = [trg_vol, zeros, trg_seg]
         yield (invols, outvols)
 
 
-def template_creation(vol_names, atlas, bidir=False, batch_size=1, **kwargs):
+def template_creation(vol_names, bidir=False, batch_size=1, **kwargs):
     """
     Generator for unconditional template creation.
 
     Parameters:
         vol_names: List of volume files to load.
-        atlas: Atlas input volume data.
         bidir: Yield input image as output for bidirectional models. Default is False.
         batch_size: Batch size. Default is 1.
         kwargs: Forwarded to the internal volgen generator.
     """
-    shape = atlas.shape[1:-1]
-    zeros = np.zeros((batch_size, *shape, len(shape)))
-    atlas = np.repeat(atlas, batch_size, axis=0)
+    zeros = None
     gen = volgen(vol_names, batch_size=batch_size, **kwargs)
     while True:
         scan = next(gen)[0]
-        invols  = [atlas, scan]  # TODO: this is opposite of the normal ordering and might be confusing
-        outvols = [scan, atlas, zeros, zeros] if bidir else [scan, zeros, zeros]
+
+        # cache zeros
+        if zeros is None:
+            shape = scan.shape[1:-1]
+            zeros = np.zeros((1, *shape, len(shape)))
+
+        invols = [scan]
+        outvols = [scan, zeros, zeros, zeros] if bidir else [scan, zeros, zeros]
         yield (invols, outvols)
 
 
-def conditional_template_creation(vol_names, atlas, attributes, batch_size=1, np_var='vol', pad_shape=None, add_feat_axis=True):
+def conditional_template_creation(vol_names, atlas, attributes,
+                                  batch_size=1, np_var='vol', pad_shape=None, add_feat_axis=True):
     """
     Generator for conditional template creation.
 
@@ -216,32 +240,34 @@ def conditional_template_creation(vol_names, atlas, attributes, batch_size=1, np
         pheno = np.stack([attributes[vol_names[i]] for i in indices], axis=0)
 
         # load volumes and concatenate
-        load_params = dict(np_var=np_var, add_batch_axis=True, add_feat_axis=add_feat_axis, pad_shape=pad_shape)
+        load_params = dict(np_var=np_var, add_batch_axis=True,
+                           add_feat_axis=add_feat_axis, pad_shape=pad_shape)
         vols = [py.utils.load_volfile(vol_names[i], **load_params) for i in indices]
         vols = np.concatenate(vols, axis=0)
 
-        invols  = [pheno, atlas, vols]
+        invols = [pheno, atlas, vols]
         outvols = [vols, zeros, zeros, zeros]
         yield (invols, outvols)
 
 
 def surf_semisupervised(
-        vol_names,
-        atlas_vol,
-        atlas_seg,
-        nb_surface_pts,
-        labels=None,
-        batch_size=1,
-        surf_bidir=True,
-        surface_pts_upsample_factor=2,
-        smooth_seg_std=1,
-        nb_labels_sample=None,
-        sdt_vol_resize=1,
-        align_segs=False,
-        add_feat_axis=True
-    ):
+    vol_names,
+    atlas_vol,
+    atlas_seg,
+    nb_surface_pts,
+    labels=None,
+    batch_size=1,
+    surf_bidir=True,
+    surface_pts_upsample_factor=2,
+    smooth_seg_std=1,
+    nb_labels_sample=None,
+    sdt_vol_resize=1,
+    align_segs=False,
+    add_feat_axis=True
+):
     """
-    Scan-to-atlas generator for semi-supervised learning using surface point clouds from segmentations.
+    Scan-to-atlas generator for semi-supervised learning using surface point clouds 
+    from segmentations.
 
     Parameters:
         vol_names: List of volume files to load.
@@ -281,24 +307,28 @@ def surf_semisupervised(
     atlas_seg_bs = np.repeat(atlas_seg[np.newaxis, ..., np.newaxis], batch_size, axis=0)
 
     # prepare surface extraction function
-    std_to_surf = lambda x, y: py.utils.sdt_to_surface_pts(x, y, surface_pts_upsample_factor=surface_pts_upsample_factor, thr=(1/surface_pts_upsample_factor + 1e-5))
-    
+    std_to_surf = lambda x, y: py.utils.sdt_to_surface_pts(
+        x, y,
+        surface_pts_upsample_factor=surface_pts_upsample_factor,
+        thr=(1 / surface_pts_upsample_factor + 1e-5))
+
     # prepare zeros, which will be used for outputs unused in cost functions
     zero_flow = np.zeros((batch_size, *vol_shape, len(vol_shape)))
     zero_surface_values = np.zeros((batch_size, nb_surface_pts, 1))
 
     # precompute label edge volumes
-    atlas_sdt = [None] * len(labels) 
-    atlas_label_vols = [None] * len(labels) 
+    atlas_sdt = [None] * len(labels)
+    atlas_label_vols = [None] * len(labels)
     nb_edges = np.zeros(len(labels))
     for li, label in enumerate(labels):  # if only one label, get surface points here
         atlas_label_vols[li] = atlas_seg == label
         atlas_label_vols[li] = py.utils.clean_seg(atlas_label_vols[li], smooth_seg_std)
-        atlas_sdt[li] = py.utils.vol_to_sdt(atlas_label_vols[li], sdt=True, sdt_vol_resize=sdt_vol_resize)
+        atlas_sdt[li] = py.utils.vol_to_sdt(
+            atlas_label_vols[li], sdt=True, sdt_vol_resize=sdt_vol_resize)
         nb_edges[li] = np.sum(np.abs(atlas_sdt[li]) < 1.01)
     layer_edge_ratios = nb_edges / np.sum(nb_edges)
 
-    # if working with all the labels passed in (i.e. no label sampling per batch), 
+    # if working with all the labels passed in (i.e. no label sampling per batch),
     # pre-compute the atlas surface points
     atlas_surface_pts = np.zeros((batch_size, nb_surface_pts, len(vol_shape) + 1))
     if nb_labels_sample == len(labels):
@@ -306,13 +336,14 @@ def surf_semisupervised(
         for li, label in enumerate(labels):  # if only one label, get surface points here
             atlas_surface_pts_ = std_to_surf(atlas_sdt[li], nb_surface_pts_sel[li])[np.newaxis, ...]
             # get the surface point stack indexes for this element
-            srf_idx = slice(int(np.sum(nb_surface_pts_sel[:li])), int(np.sum(nb_surface_pts_sel[:li + 1])))
+            srf_idx = slice(int(np.sum(nb_surface_pts_sel[:li])), int(
+                np.sum(nb_surface_pts_sel[:li + 1])))
             atlas_surface_pts[:, srf_idx, :-1] = np.repeat(atlas_surface_pts_, batch_size, 0)
-            atlas_surface_pts[:, srf_idx,  -1] = li
+            atlas_surface_pts[:, srf_idx, -1] = li
 
     # generator
-    gen = volgen(vol_names, return_segs=True, batch_size=batch_size, add_feat_axis=add_feat_axis)
-    
+    gen = volgen(vol_names, segs=True, batch_size=batch_size, add_feat_axis=add_feat_axis)
+
     assert batch_size == 1, 'only batch size 1 supported for now'
 
     while True:
@@ -325,10 +356,12 @@ def surf_semisupervised(
         # get random labels
         sel_label_idxs = range(len(labels))  # all labels
         if nb_labels_sample != len(labels):
-            sel_label_idxs = np.sort(np.random.choice(range(len(labels)), size=nb_labels_sample, replace=False))
+            sel_label_idxs = np.sort(np.random.choice(
+                range(len(labels)), size=nb_labels_sample, replace=False))
             sel_layer_edge_ratios = [layer_edge_ratios[li] for li in sel_label_idxs]
-            nb_surface_pts_sel = py.utils.get_surface_pts_per_label(nb_surface_pts, sel_layer_edge_ratios)
-                
+            nb_surface_pts_sel = py.utils.get_surface_pts_per_label(
+                nb_surface_pts, sel_layer_edge_ratios)
+
         # prepare signed distance transforms and surface point arrays
         X_sdt_k = np.zeros((batch_size, *sdt_shape, nb_labels_sample))
         atl_dt_k = np.zeros((batch_size, *sdt_shape, nb_labels_sample))
@@ -338,25 +371,28 @@ def surf_semisupervised(
 
         for li, sli in enumerate(sel_label_idxs):
             # get the surface point stack indexes for this element
-            srf_idx = slice(int(np.sum(nb_surface_pts_sel[:li])), int(np.sum(nb_surface_pts_sel[:li+1])))
+            srf_idx = slice(int(np.sum(nb_surface_pts_sel[:li])), int(
+                np.sum(nb_surface_pts_sel[:li + 1])))
 
             # get atlas surface points for this label
             if nb_labels_sample != len(labels):
-                atlas_surface_pts_ = std_to_surf(atlas_sdt[sli], nb_surface_pts_sel[li])[np.newaxis, ...]
+                atlas_surface_pts_ = std_to_surf(atlas_sdt[sli], nb_surface_pts_sel[li])[
+                    np.newaxis, ...]
                 atlas_surface_pts[:, srf_idx, :-1] = np.repeat(atlas_surface_pts_, batch_size, 0)
-                atlas_surface_pts[:, srf_idx,  -1] = sli
+                atlas_surface_pts[:, srf_idx, -1] = sli
 
             # compute X distance from surface
             X_label = X_seg == labels[sli]
             X_label = py.utils.clean_seg_batch(X_label, smooth_seg_std)
-            X_sdt_k[..., li] = py.utils.vol_to_sdt_batch(X_label, sdt=True, sdt_vol_resize=sdt_vol_resize)[..., 0]
+            X_sdt_k[..., li] = py.utils.vol_to_sdt_batch(
+                X_label, sdt=True, sdt_vol_resize=sdt_vol_resize)[..., 0]
 
             if surf_bidir:
                 atl_dt = atlas_sdt[li][np.newaxis, ...]
                 atl_dt_k[..., li] = np.repeat(atl_dt, batch_size, 0)
                 ssp_lst = [std_to_surf(f[...], nb_surface_pts_sel[li]) for f in X_sdt_k[..., li]]
                 subj_surface_pts[:, srf_idx, :-1] = np.stack(ssp_lst, 0)
-                subj_surface_pts[:, srf_idx,  -1] = li
+                subj_surface_pts[:, srf_idx, -1] = li
 
         # check if returning segmentations instead of images
         # this is a bit hacky for basically building a segmentation-only network (no images)
@@ -370,10 +406,46 @@ def surf_semisupervised(
 
         # finally, output
         if surf_bidir:
-            inputs  = [X_ret, atlas_ret, X_sdt_k, atl_dt_k, subj_surface_pts, atlas_surface_pts]
+            inputs = [X_ret, atlas_ret, X_sdt_k, atl_dt_k, subj_surface_pts, atlas_surface_pts]
             outputs = [atlas_ret, X_ret, zero_flow, zero_surface_values, zero_surface_values]
         else:
-            inputs  = [X_ret, atlas_ret, X_sdt_k, atlas_surface_pts]
+            inputs = [X_ret, atlas_ret, X_sdt_k, atlas_surface_pts]
             outputs = [atlas_ret, X_ret, zero_flow, zero_surface_values]
 
         yield (inputs, outputs)
+
+
+def synthmorph(label_maps, batch_size=1, same_subj=False, flip=True):
+    """
+    Generator for SynthMorph registration.
+
+    Parameters:
+        labels_maps: List of pre-loaded ND label maps, each as a NumPy array.
+        batch_size: Batch size. Default is 1.
+        same_subj: Whether the same label map is returned as the source and target for further
+            augmentation. Default is False.
+        flip: Whether axes are flipped randomly. Default is True.
+    """
+    in_shape = label_maps[0].shape
+    num_dim = len(in_shape)
+
+    # "True" moved image and warp, that will be ignored by SynthMorph losses.
+    void = np.zeros((batch_size, *in_shape, num_dim), dtype='float32')
+
+    rand = np.random.default_rng()
+    prop = dict(replace=False, shuffle=False)
+    while True:
+        ind = rand.integers(len(label_maps), size=2 * batch_size)
+        x = [label_maps[i] for i in ind]
+
+        if same_subj:
+            x = x[:batch_size] * 2
+        x = np.stack(x)[..., None]
+
+        if flip:
+            axes = rand.choice(num_dim, size=rand.integers(num_dim + 1), **prop)
+            x = np.flip(x, axis=axes + 1)
+
+        src = x[:batch_size, ...]
+        trg = x[batch_size:, ...]
+        yield [src, trg], [void] * 2
